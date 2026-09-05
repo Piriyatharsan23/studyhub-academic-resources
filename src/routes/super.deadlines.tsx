@@ -1,0 +1,316 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { format, formatDistanceToNow } from "date-fns";
+import { Archive, ArchiveRestore, CalendarClock, Loader2, Plus, Search, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
+} from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SuperShell } from "@/components/SuperShell";
+import { supabase } from "@/integrations/supabase/client";
+import { logActivity } from "@/lib/activity";
+import { notifyDeadlineCreated } from "@/lib/notify-deadline.functions";
+
+
+export const Route = createFileRoute("/super/deadlines")({
+  head: () => ({ meta: [{ title: "Deadlines — Super Admin" }] }),
+  component: DeadlinesPage,
+});
+
+type Deadline = {
+  id: string; title: string; deadline_at: string;
+  semester_id: string; subject_id: string;
+  status: string; is_archived: boolean;
+};
+
+function DeadlinesPage() {
+  const qc = useQueryClient();
+  const [q, setQ] = useState("");
+  const [sem, setSem] = useState("all");
+  const [showArchived, setShowArchived] = useState(false);
+  const [open, setOpen] = useState(false);
+
+
+  const semestersQ = useQuery({
+    queryKey: ["super-all-semesters"],
+    queryFn: async () => (await supabase.from("semesters").select("id,name").order("name")).data ?? [],
+  });
+  const subjectsQ = useQuery({
+    queryKey: ["super-all-subjects"],
+    queryFn: async () => (await supabase.from("subjects").select("id,name,semester_id").order("name")).data ?? [],
+  });
+
+  const listQ = useQuery({
+    queryKey: ["super-deadlines", sem, showArchived],
+    queryFn: async () => {
+      let qb = supabase
+        .from("deadlines")
+        .select("id,title,deadline_at,semester_id,subject_id,status,is_archived")
+        .order("deadline_at", { ascending: true })
+        .limit(500);
+      if (sem !== "all") qb = qb.eq("semester_id", sem);
+      if (!showArchived) qb = qb.eq("is_archived", false);
+      const { data, error } = await qb;
+      if (error) throw error;
+      return (data ?? []) as Deadline[];
+    },
+  });
+
+  const subById = useMemo(() => Object.fromEntries((subjectsQ.data ?? []).map((s) => [s.id, s])), [subjectsQ.data]);
+  const semById = useMemo(() => Object.fromEntries((semestersQ.data ?? []).map((s) => [s.id, s])), [semestersQ.data]);
+
+  const rows = useMemo(() => {
+    const list = listQ.data ?? [];
+    if (!q.trim()) return list;
+    const n = q.toLowerCase();
+    return list.filter((d) => d.title.toLowerCase().includes(n));
+  }, [listQ.data, q]);
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ["super-deadlines"] });
+
+  const toggleArchive = async (d: Deadline) => {
+    const { error } = await supabase.from("deadlines").update({ is_archived: !d.is_archived }).eq("id", d.id);
+    if (error) return toast.error(error.message);
+    await logActivity({
+      action_type: "deadline_archive",
+      description: `${d.is_archived ? "Restored" : "Archived"} deadline "${d.title}"`,
+      target_type: "deadline", target_id: d.id,
+      semester_id: d.semester_id, subject_id: d.subject_id,
+    });
+    toast.success(d.is_archived ? "Restored" : "Archived");
+    refresh();
+  };
+
+  const remove = async (d: Deadline) => {
+    if (!confirm(`Delete deadline "${d.title}"?`)) return;
+    const { error } = await supabase.from("deadlines").delete().eq("id", d.id);
+    if (error) return toast.error(error.message);
+    await logActivity({
+      action_type: "deadline_delete", description: `Deleted deadline "${d.title}"`,
+      target_type: "deadline", target_id: d.id,
+      semester_id: d.semester_id, subject_id: d.subject_id,
+    });
+    toast.success("Deleted");
+    refresh();
+  };
+
+  return (
+    <SuperShell title="All Deadlines" description="Oversee every deadline across the platform.">
+      <div className="flex justify-end mb-4">
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogTrigger asChild>
+            <Button><Plus className="mr-2 h-4 w-4" />New deadline</Button>
+          </DialogTrigger>
+          <NewDeadlineDialog
+            semesters={semestersQ.data ?? []}
+            subjects={subjectsQ.data ?? []}
+            onSaved={() => { setOpen(false); refresh(); }}
+          />
+        </Dialog>
+      </div>
+
+      <div className="rounded-2xl border border-border bg-card p-4 shadow-soft mb-4">
+
+        <div className="grid gap-2 md:grid-cols-3">
+          <div className="relative md:col-span-2">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input className="pl-9" placeholder="Search deadlines…" value={q} onChange={(e) => setQ(e.target.value)} />
+          </div>
+          <Select value={sem} onValueChange={setSem}>
+            <SelectTrigger><SelectValue placeholder="Semester" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All semesters</SelectItem>
+              {(semestersQ.data ?? []).map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="mt-2 flex items-center gap-3 text-sm">
+          <label className="inline-flex items-center gap-2 text-muted-foreground">
+            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+            Show archived
+          </label>
+          <span className="ml-auto text-xs text-muted-foreground">{rows.length} deadline{rows.length === 1 ? "" : "s"}</span>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-border bg-card shadow-soft overflow-hidden">
+        {listQ.isLoading ? (
+          <div className="p-10 text-center text-muted-foreground"><Loader2 className="inline mr-2 h-4 w-4 animate-spin" />Loading…</div>
+        ) : rows.length === 0 ? (
+          <div className="p-10 text-center text-muted-foreground">No deadlines match these filters.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[680px]">
+              <thead className="bg-muted/40 text-xs uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="text-left font-medium px-4 py-3">Deadline</th>
+                  <th className="text-left font-medium px-4 py-3">When</th>
+                  <th className="text-left font-medium px-4 py-3">Semester / Subject</th>
+                  <th className="text-right font-medium px-4 py-3">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {rows.map((d) => {
+                  const at = new Date(d.deadline_at);
+                  const past = at.getTime() < Date.now();
+                  return (
+                    <tr key={d.id} className={`hover:bg-muted/30 ${d.is_archived ? "opacity-60" : ""}`}>
+                      <td className="px-4 py-3">
+                        <div className="font-medium inline-flex items-center gap-2 flex-wrap">
+                          <CalendarClock className="h-4 w-4 text-muted-foreground shrink-0" />
+                          <span className="break-words">{d.title}</span>
+                          {d.is_archived && <span className="text-[10px] uppercase tracking-wider rounded bg-muted px-1.5 py-0.5">archived</span>}
+                          {past && !d.is_archived && <span className="text-[10px] uppercase tracking-wider rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 px-1.5 py-0.5">expired</span>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
+                        <div>{format(at, "MMM d, yyyy · h:mm a")}</div>
+                        <div className="text-xs">{formatDistanceToNow(at, { addSuffix: true })}</div>
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground text-xs">
+                        <div>{semById[d.semester_id]?.name ?? "—"}</div>
+                        <div className="text-foreground/80">{subById[d.subject_id]?.name ?? "—"}</div>
+                      </td>
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                        <Button size="sm" variant="ghost" onClick={() => toggleArchive(d)}>
+                          {d.is_archived ? <ArchiveRestore className="h-4 w-4" /> : <Archive className="h-4 w-4" />}
+                        </Button>
+                        <Button size="sm" variant="ghost" className="text-rose-400 hover:text-rose-300" onClick={() => remove(d)}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </SuperShell>
+  );
+}
+
+function toLocalInput(iso: string | null) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function NewDeadlineDialog({
+  semesters, subjects, onSaved,
+}: {
+  semesters: { id: string; name: string }[];
+  subjects: { id: string; name: string; semester_id: string }[];
+  onSaved: () => void;
+}) {
+  const [semesterId, setSemesterId] = useState("");
+  const [subjectId, setSubjectId] = useState("");
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [when, setWhen] = useState(toLocalInput(null));
+  const [saving, setSaving] = useState(false);
+
+  const semSubjects = useMemo(
+    () => subjects.filter((s) => s.semester_id === semesterId),
+    [subjects, semesterId],
+  );
+
+  const submit = async () => {
+    if (!semesterId) return toast.error("Select a semester");
+    if (!subjectId) return toast.error("Select a subject");
+    if (!title.trim()) return toast.error("Title is required");
+    if (!when) return toast.error("Pick a due date and time");
+
+    setSaving(true);
+    try {
+      const { data: userRes } = await supabase.auth.getUser();
+      const { data, error } = await supabase.from("deadlines").insert({
+        title: title.trim(),
+        description: description.trim() || null,
+        semester_id: semesterId,
+        subject_id: subjectId,
+        deadline_at: new Date(when).toISOString(),
+        created_by: userRes.user?.id ?? null,
+        status: "active",
+      }).select("id").maybeSingle();
+      if (error) throw error;
+
+      await logActivity({
+        action_type: "deadline_create",
+        description: `Created deadline "${title.trim()}"`,
+        target_type: "deadline", target_id: data?.id ?? null,
+        semester_id: semesterId, subject_id: subjectId,
+      });
+      toast.success("Deadline created");
+
+      if (data?.id) {
+        try {
+          const res = await notifyDeadlineCreated({ data: { deadlineId: data.id } });
+          if (res?.sent) toast.success(`Notified ${res.sent} Telegram subscriber${res.sent === 1 ? "" : "s"}`);
+        } catch (err) {
+          console.error("telegram notify failed", err);
+        }
+      }
+
+      setTitle(""); setDescription(""); setWhen(""); setSubjectId("");
+      onSaved();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to save");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <DialogContent className="max-w-lg">
+      <DialogHeader><DialogTitle>New deadline</DialogTitle></DialogHeader>
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-sm font-medium">Semester</label>
+            <Select value={semesterId} onValueChange={(v) => { setSemesterId(v); setSubjectId(""); }}>
+              <SelectTrigger><SelectValue placeholder="Semester" /></SelectTrigger>
+              <SelectContent>
+                {semesters.map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
+            <label className="text-sm font-medium">Subject</label>
+            <Select value={subjectId} onValueChange={setSubjectId} disabled={!semesterId}>
+              <SelectTrigger><SelectValue placeholder={semesterId ? "Subject" : "Pick semester first"} /></SelectTrigger>
+              <SelectContent>
+                {semSubjects.map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div>
+          <label className="text-sm font-medium">Title</label>
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={140} placeholder="e.g. Assignment 2 submission" />
+        </div>
+        <div>
+          <label className="text-sm font-medium">Due at</label>
+          <Input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
+        </div>
+        <div>
+          <label className="text-sm font-medium">Description (optional)</label>
+          <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} maxLength={800} />
+        </div>
+      </div>
+      <DialogFooter>
+        <Button onClick={submit} disabled={saving}>
+          {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Create
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  );
+}
+
